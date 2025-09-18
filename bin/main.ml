@@ -276,7 +276,7 @@ module Gen = struct
       | OpOp s, cs -> Op (s, cs)
       | _ -> failwith "bad op constructor"
 
-    let children s = fold_shape (fun a b -> b :: a) [] s
+    let children s = List.rev @@ fold_shape (fun a b -> b :: a) [] s
     let map_children s f = map_shape f s
   end
 
@@ -315,11 +315,17 @@ module Gen = struct
 
     let cost f shape =
       let open L in
+      let c =
+        List.fold_left (fun a b -> a +. b) 0. (List.map f (children shape))
+      in
       match shape with
       | True -> 1.0
       | False -> 1.0
       | BV v -> 2.0
-      | o -> List.fold_left (fun i j -> i +. j) 2.0 (List.map f (children o))
+      | Op ("and", _) -> 1.0 +. c
+      | Op ("or", _) -> 1.0 +. c
+      | Op ("=>", _) -> 2.0 +. c
+      | o -> 6.0 +. c
   end
 
   module Extractor = MakeExtractor (L) (Cost)
@@ -385,40 +391,54 @@ module Gen = struct
       let into = query @@ Atom "false" in
       Rule.make_constant ~from ~into
     in
+    let or_false_l =
+      let from = query @@ List [ Atom "or"; Atom "false"; Atom "?a" ] in
+      let into = query @@ Atom "?a" in
+      Rule.make_constant ~from ~into
+    in
+    let or_false_r =
+      let from = query @@ List [ Atom "or"; Atom "?a"; Atom "false" ] in
+      let into = query @@ Atom "?a" in
+      Rule.make_constant ~from ~into
+    in
     let or_true_l =
       let from = query @@ List [ Atom "or"; Atom "true"; Atom "?a" ] in
       let into = query @@ Atom "true" in
       Rule.make_constant ~from ~into
     in
-    let or_refute =
-      let from = query @@ List [ Atom "and"; Atom "false"; Atom "false" ] in
-      let into = query @@ Atom "false" in
-      Rule.make_constant ~from ~into
-    in
     let or_true_r =
-      let from = query @@ List [ Atom "and"; Atom "?a"; Atom "true" ] in
+      let from = query @@ List [ Atom "or"; Atom "?a"; Atom "true" ] in
       let into = query @@ Atom "true" in
       Rule.make_constant ~from ~into
     in
-    let impl =
-      let from = query @@ List [ Atom "=>"; Atom "true"; Atom "?a" ] in
+    let norm_impl =
+      let from = query @@ List [ Atom "=>"; Atom "?l"; Atom "?r" ] in
+      let into =
+        query @@ List [ Atom "or"; Atom "?r"; List [ Atom "not"; Atom "?l" ] ]
+      in
+      Rule.make_constant ~from ~into
+    in
+    let double_negation =
+      let from = query @@ List [ Atom "not"; List [ Atom "not"; Atom "?a" ] ] in
       let into = query @@ Atom "?a" in
       Rule.make_constant ~from ~into
     in
-    let impl_trivial =
-      let from = query @@ List [ Atom "=>"; Atom "?a"; Atom "true" ] in
-      let into = query @@ Atom "true" in
+    let bool_inv =
+      let from = query @@ List [ Atom "not"; Atom "true" ] in
+      let into = query @@ Atom "false" in
       Rule.make_constant ~from ~into
     in
     [
-      impl;
-      impl_trivial;
+      double_negation;
+      bool_inv;
+      norm_impl;
       ite_true;
       ite_false;
       and_true;
       and_refute_l;
       and_refute_r;
-      or_refute;
+      or_false_l;
+      or_false_r;
       or_true_l;
       or_true_r;
       and_simp_l;
@@ -476,9 +496,10 @@ let () =
     | o -> failwith @@ "unexpected: " ^ Sexp.to_string o
   in
   let asserts = List.concat_map add x in
-  let exprs = asserts |> StringMap.of_list in
   let tr = add_sexp graph (Atom "true") in
+  let fr = add_sexp graph (Atom "false") in
   let _ = EGraph.run_until_saturation graph rewrite_rules in
+  if EGraph.class_equal (EGraph.freeze graph) tr fr then print_endline "unsat";
   let print_exp n e =
     if not (EGraph.class_equal (EGraph.freeze graph) e tr) then
       let e = Extractor.extract graph e in
