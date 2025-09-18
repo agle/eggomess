@@ -33,6 +33,9 @@ module PrimQFBV = struct
 
   type t = { w : int; v : Z.t }
 
+  let true_value = { w = 1; v = Z.of_int 1 }
+  let false_value = { w = 1; v = Z.of_int 0 }
+  let booltobv = function true -> true_value | false -> false_value
   let show (b : t) = Printf.sprintf "0x%s:bv%d" (Z.format "%x" @@ b.v) b.w
   let pp fmt b = Format.pp_print_string fmt (show b)
   let ones ~(size : int) = z_extract Z.minus_one 0 size
@@ -282,15 +285,15 @@ module Gen = struct
 
   module A = struct
     type t = unit
-    type data = unit [@@deriving show, eq]
+    type data = PrimQFBV.t option [@@deriving show, eq]
 
-    let default = ()
-    let equal_data a b = true
+    let default : data = None
+    let equal_data a b = Option.compare PrimQFBV.compare a b = 0
   end
 
   module MA
       (S :
-        GRAPH_API
+        Ego.Generic.GRAPH_API
           with type 'p t = (Id.t L.shape, A.t, A.data, 'p) egraph
            and type analysis := A.t
            and type data := A.data
@@ -299,13 +302,87 @@ module Gen = struct
   struct
     type 'p t = (Ego.Id.t L.shape, A.t, A.data, 'p) Ego.Generic.egraph
 
+    let eval (v : A.data L.shape) : A.data =
+      let open L in
+      match v with
+      | BV v -> Some v
+      | True -> Some PrimQFBV.true_value
+      | False -> Some PrimQFBV.false_value
+      | Or ls
+        when List.exists
+               (function
+                 | Some i when PrimQFBV.equal i PrimQFBV.true_value -> true
+                 | _ -> false)
+               ls ->
+          Some PrimQFBV.true_value
+      | And ls
+        when List.exists
+               (function
+                 | Some i when i = PrimQFBV.false_value -> true | _ -> false)
+               ls ->
+          Some PrimQFBV.false_value
+      | And ls
+        when List.for_all
+               (function
+                 | Some i when PrimQFBV.equal i PrimQFBV.true_value -> true
+                 | _ -> false)
+               ls ->
+          Some PrimQFBV.true_value
+      | Or ls
+        when List.for_all
+               (function
+                 | Some i when PrimQFBV.equal i PrimQFBV.false_value -> true
+                 | _ -> false)
+               ls ->
+          Some PrimQFBV.false_value
+      | Op ("bvadd", [ Some l; Some r ]) -> Some (PrimQFBV.add l r)
+      | Op ("bvand", [ Some l; Some r ]) -> Some (PrimQFBV.bitand l r)
+      | Op ("bvor", [ Some l; Some r ]) -> Some (PrimQFBV.bitor l r)
+      | Op ("bvxor", [ Some l; Some r ]) -> Some (PrimQFBV.bitxor l r)
+      | Op ("bvsub", [ Some l; Some r ]) -> Some (PrimQFBV.sub l r)
+      | Op ("bvnot", [ Some r ]) -> Some (PrimQFBV.bitnot r)
+      | Op ("bvneg", [ Some r ]) -> Some (PrimQFBV.neg r)
+      | Op ("bvsle", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.sle l r)
+      | Op ("bvslt", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.slt l r)
+      | Op ("bvsge", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.sge l r)
+      | Op ("bvsgt", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.sgt l r)
+      | Op ("bvule", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.ule l r)
+      | Op ("bvult", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.ult l r)
+      | Op ("bvuge", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.uge l r)
+      | Op ("bvugt", [ Some l; Some r ]) ->
+          Some (PrimQFBV.booltobv @@ PrimQFBV.ugt l r)
+      | Op ("=", [ Some l; Some r ]) when PrimQFBV.equal l r ->
+          Some PrimQFBV.true_value
+      | Op ("=", [ Some l; Some r ]) when not @@ PrimQFBV.equal l r ->
+          Some PrimQFBV.false_value
+      | _ -> None
+
     let make : Ego.Generic.ro t -> Ego.Id.t L.shape -> A.data =
-     fun g s -> A.default
+     fun graph term -> eval (L.map_children term (S.get_data graph))
 
     let merge : A.t -> A.data -> A.data -> A.data * (bool * bool) =
-     fun s d d -> (A.default, (false, false))
+     fun s d d ->
+      match (d, d) with
+      | Some l, None -> (Some l, (false, true))
+      | None, Some l -> (Some l, (true, false))
+      | Some l, Some r when PrimQFBV.equal l r -> (Some l, (false, false))
+      | Some l, Some r -> (None, (false, false))
+      | None, None -> (None, (false, false))
 
-    let modify : Ego.Generic.rw t -> Ego.Id.t -> unit = fun g i -> ()
+    let modify : rw t -> Ego.Id.t -> unit =
+     fun graph cls ->
+      match S.get_data (S.freeze graph) cls with
+      | None -> ()
+      | Some n ->
+          let nw_cls = S.add_node graph (L.Mk (BV n)) in
+          S.merge graph nw_cls cls
   end
 
   module EGraph = Make (L) (A) (MA)
@@ -322,10 +399,10 @@ module Gen = struct
       | True -> 1.0
       | False -> 1.0
       | BV v -> 2.0
-      | Op ("and", _) -> 1.0 +. c
-      | Op ("or", _) -> 1.0 +. c
-      | Op ("=>", _) -> 2.0 +. c
-      | o -> 6.0 +. c
+      | Op ("and", _) -> 20.0 +. c
+      | Op ("or", _) -> 20.0 +. c
+      | Op ("=>", _) -> 20.0 +. c
+      | o -> 60.0 +. c
   end
 
   module Extractor = MakeExtractor (L) (Cost)
@@ -338,17 +415,81 @@ module Gen = struct
   let rewrite_rules =
     let open Sexplib0.Sexp in
     let open EGraph in
+    let and_const_true =
+      let from = query @@ List [ Atom "and"; Atom "?a"; Atom "?b" ] in
+      let into = query @@ Atom "true" in
+      let cond =
+       fun graph enode emap ->
+        EGraph.get_data (EGraph.freeze graph) enode |> function
+        | Some a when a = PrimQFBV.true_value -> true
+        | _ -> false
+      in
+      Rule.make_conditional ~from ~into ~cond
+    in
+    let and_const_false =
+      let from = query @@ List [ Atom "and"; Atom "?a"; Atom "?b" ] in
+      let into = query @@ Atom "false" in
+      let cond =
+       fun graph enode emap ->
+        EGraph.get_data (EGraph.freeze graph) enode |> function
+        | Some a when a = PrimQFBV.false_value -> true
+        | _ -> false
+      in
+      Rule.make_conditional ~from ~into ~cond
+    in
+    let or_const_true =
+      let from = query @@ List [ Atom "or"; Atom "?a"; Atom "?b" ] in
+      let into = query @@ Atom "true" in
+      let cond =
+       fun graph enode emap ->
+        EGraph.get_data (EGraph.freeze graph) enode |> function
+        | Some a when a = PrimQFBV.true_value -> true
+        | _ -> false
+      in
+      Rule.make_conditional ~from ~into ~cond
+    in
+    let or_const_false =
+      let from = query @@ List [ Atom "or"; Atom "?a"; Atom "?b" ] in
+      let into = query @@ Atom "false" in
+      let cond =
+       fun graph enode emap ->
+        EGraph.get_data (EGraph.freeze graph) enode |> function
+        | Some a when a = PrimQFBV.false_value -> true
+        | _ -> false
+      in
+      Rule.make_conditional ~from ~into ~cond
+    in
+
     let eq_rule =
       let from = query @@ List [ Atom "="; Atom "?a"; Atom "?b" ] in
       let into = query @@ Atom "true" in
-      let cond :
-          (Id.t L.shape, unit, unit, rw) egraph ->
-          Id.t ->
-          Id.t StringMap.t ->
-          bool =
+      let cond =
        fun graph enode emap ->
         EGraph.class_equal (EGraph.freeze graph) (StringMap.find "a" emap)
           (StringMap.find "b" emap)
+      in
+      Rule.make_conditional ~from ~into ~cond
+    in
+    let eq_const_false =
+      let from = query @@ List [ Atom "="; Atom "?a"; Atom "?b" ] in
+      let into = query @@ Atom "false" in
+      let cond =
+       fun graph enode emap ->
+        EGraph.get_data (EGraph.freeze graph) enode |> function
+        | Some a when a = PrimQFBV.false_value -> true
+        | _ -> false
+      in
+      Rule.make_conditional ~from ~into ~cond
+    in
+    let eq_rule_consts =
+      let from = query @@ List [ Atom "="; Atom "?a"; Atom "?b" ] in
+      let into = query @@ Atom "true" in
+      let cond =
+       fun graph enode emap ->
+        let fg = EGraph.freeze graph in
+        let a = EGraph.get_data fg (StringMap.find "a" emap) in
+        let b = EGraph.get_data fg (StringMap.find "b" emap) in
+        match (a, b) with Some a, Some b when a = b -> true | _ -> false
       in
       Rule.make_conditional ~from ~into ~cond
     in
@@ -429,6 +570,12 @@ module Gen = struct
       Rule.make_constant ~from ~into
     in
     [
+      eq_rule;
+      eq_const_false;
+      and_const_false;
+      and_const_true;
+      or_const_false;
+      or_const_true;
       double_negation;
       bool_inv;
       norm_impl;
@@ -443,7 +590,6 @@ module Gen = struct
       or_true_r;
       and_simp_l;
       and_simp_r;
-      eq_rule;
     ]
 end
 
@@ -498,7 +644,17 @@ let () =
   let asserts = List.concat_map add x in
   let tr = add_sexp graph (Atom "true") in
   let fr = add_sexp graph (Atom "false") in
-  let _ = EGraph.run_until_saturation graph rewrite_rules in
+
+  EGraph.merge graph tr
+    (EGraph.add_node graph (L.Mk (L.BV PrimQFBV.true_value)));
+  EGraph.merge graph fr
+    (EGraph.add_node graph (L.Mk (L.BV PrimQFBV.false_value)));
+  EGraph.rebuild graph;
+
+  let _ =
+    EGraph.run_until_saturation ~fuel:`Unbounded ~node_limit:`Unbounded graph
+      rewrite_rules
+  in
   if EGraph.class_equal (EGraph.freeze graph) tr fr then print_endline "unsat";
   let print_exp n e =
     if not (EGraph.class_equal (EGraph.freeze graph) e tr) then
