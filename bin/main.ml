@@ -194,9 +194,37 @@ module Gen = struct
 
     type t = Mk of t shape [@@unboxed] [@@deriving show]
 
+    let rec flatten_assoc (a : t) : t =
+      (match a with
+      | Mk (And [ Mk (And xs); Mk (And ys) ]) ->
+          Mk (And (List.map flatten_assoc @@ xs @ ys))
+      | Mk (And [ i; Mk (And xs) ]) ->
+          Mk (And (List.map flatten_assoc @@ xs @ [ i ]))
+      | Mk (Or [ i; Mk (Or xs) ]) ->
+          Mk (Or (List.map flatten_assoc @@ xs @ [ i ]))
+      | Mk (And [ Mk (And xs); i ]) ->
+          Mk (And (List.map flatten_assoc @@ (i :: xs)))
+      | Mk (Or [ Mk (Or xs); i ]) ->
+          Mk (Or (List.map flatten_assoc @@ (i :: xs)))
+      | Mk (Or xs) -> Mk (Or (List.map flatten_assoc xs))
+      | Mk (And xs) -> Mk (And (List.map flatten_assoc xs))
+      | Mk (Op (o, xs)) -> Mk (Op (o, List.map flatten_assoc xs))
+      | Mk (Ite (a, b, c)) ->
+          Mk (Ite (flatten_assoc a, flatten_assoc b, flatten_assoc c))
+      | i -> i)
+      |> function
+      | Mk (And (h :: tl)) ->
+          (List.fold_left (fun x y ->
+               match (x, y) with
+               | Mk (And xs), Mk (And ys) -> Mk (And (xs @ ys))
+               | Mk (And xs), z -> Mk (And (xs @ [ z ]))
+               | _ -> failwith "no"))
+            (Mk (And [ h ])) tl
+      | o -> o
+
     let rec to_sexp e =
       let open Sexplib0.Sexp in
-      match e with
+      match flatten_assoc e with
       | Mk True -> Atom "true"
       | Mk False -> Atom "true"
       | Mk (BV v) ->
@@ -595,11 +623,11 @@ end
 
 module StringMap = Map.Make (String)
 
-let () =
+let process fname =
   let open Sexplib0 in
   let open Gen in
   let graph = EGraph.init () in
-  let x = Sexplib.Sexp.load_sexps "test.smt2" in
+  let x = Sexplib.Sexp.load_sexps fname in
 
   let add_if_equality grpah name e =
     let open Sexp in
@@ -614,10 +642,10 @@ let () =
         | h :: tl -> List.iter (EGraph.merge graph h) tl
         | _ -> ());
         EGraph.rebuild graph;
-        [ (name, outer) ]
+        [ (name, e, outer) ]
     | o ->
         print_endline @@ "assert " ^ Sexp.to_string o;
-        [ (name, add_sexp graph o) ]
+        [ (name, o, add_sexp graph o) ]
   in
 
   let c = ref 0 in
@@ -651,6 +679,10 @@ let () =
     (EGraph.add_node graph (L.Mk (L.BV PrimQFBV.false_value)));
   EGraph.rebuild graph;
 
+  let conj_asserts =
+    List.map (function n, sexp, node -> sexp) asserts |> fun i ->
+    Sexp.List (Sexp.Atom "and" :: i) |> cleanup |> add_sexp graph
+  in
   let _ =
     EGraph.run_until_saturation ~fuel:`Unbounded ~node_limit:`Unbounded graph
       rewrite_rules
@@ -659,7 +691,7 @@ let () =
   let print_exp n e =
     if not (EGraph.class_equal (EGraph.freeze graph) e tr) then
       let e = Extractor.extract graph e in
-      print_endline @@ Sexp.to_string
+      Sexp.pp_hum_indent 1 (Format.get_std_formatter ())
       @@ List
            [
              Atom "assert";
@@ -668,10 +700,22 @@ let () =
   in
   (*let e = StringMap.find "InvPrimed" exprs in
   print_exp "InvPrimed" e; *)
-  List.iter (function n, e -> print_exp n e) asserts;
+  (*List.iter (function n, e -> print_exp n e) asserts;*)
+  print_exp "ConjAsserts" conj_asserts;
   ()
 
+let () =
+  let verbose = ref false in
+  let input_files = ref "" in
+  let anon_fun i = () in
+  let speclist =
+    [ ("-i", Arg.Set_string input_files, "Input file information") ]
+  in
+  Arg.parse speclist anon_fun "usage";
+  process !input_files
+
 (*
+
 let () =
   let open Sexplib0 in
   let x = Sexplib.Sexp.load_sexps "test.smt2" in
