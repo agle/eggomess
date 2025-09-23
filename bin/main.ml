@@ -1,4 +1,6 @@
 open Ego.Basic
+module StringSet = Set.Make (String)
+module StringMap = Map.Make (String)
 
 let cost_function score (sym, children) =
   let node_score =
@@ -222,7 +224,7 @@ module Gen = struct
             (Mk (And [ h ])) tl
       | o -> o
 
-    let rec to_sexp e =
+    let rec to_sexp (consts : StringSet.t ref) e =
       let open Sexplib0.Sexp in
       match flatten_assoc e with
       | Mk True -> Atom "true"
@@ -232,10 +234,14 @@ module Gen = struct
             [
               Atom "_"; Atom ("bv" ^ Z.to_string v.v); Atom (Int.to_string v.w);
             ]
-      | Mk (And a) -> List (Atom "and" :: List.map to_sexp a)
-      | Mk (Or a) -> List (Atom "or" :: List.map to_sexp a)
-      | Mk (Ite (c, a, b)) -> List [ Atom "ite"; to_sexp a; to_sexp b ]
-      | Mk (Op (c, args)) -> List (Atom c :: List.map to_sexp args)
+      | Mk (And a) -> List (Atom "and" :: List.map (to_sexp consts) a)
+      | Mk (Or a) -> List (Atom "or" :: List.map (to_sexp consts) a)
+      | Mk (Ite (c, a, b)) ->
+          List [ Atom "ite"; to_sexp consts a; to_sexp consts b ]
+      | Mk (Op (c, [])) ->
+          consts := StringSet.add c !consts;
+          Atom c
+      | Mk (Op (c, args)) -> List (Atom c :: List.map (to_sexp consts) args)
 
     let rec of_sexp s : t =
       let open Sexplib0.Sexp in
@@ -313,10 +319,11 @@ module Gen = struct
 
   module A = struct
     type t = unit
-    type data = PrimQFBV.t option [@@deriving show, eq]
+    type value = BV of PrimQFBV.t | True | False [@@deriving eq, show]
+    type data = value option [@@deriving show, eq]
 
     let default : data = None
-    let equal_data a b = Option.compare PrimQFBV.compare a b = 0
+    let equal_data a b = Option.equal equal_value a b
   end
 
   module MA
@@ -330,77 +337,82 @@ module Gen = struct
   struct
     type 'p t = (Ego.Id.t L.shape, A.t, A.data, 'p) Ego.Generic.egraph
 
-    let eval (v : A.data L.shape) : A.data =
+    let bind2_bv op a =
+      match a with
+      | [ Some (A.BV l); Some (BV r) ] -> Some (A.BV (op l r))
+      | _ -> None
+
+    let bind2_bv_bool op a =
+      match a with
+      | [ Some (A.BV l); Some (BV r) ] -> (
+          match op l r with true -> Some A.True | false -> Some False)
+      | _ -> None
+
+    let bind2_bv op a =
+      match a with
+      | [ Some (A.BV l); Some (BV r) ] -> Some (A.BV (op l r))
+      | _ -> None
+
+    let map_bv f a = match a with Some (A.BV a) -> Some (f a) | _ -> None
+
+    let eval graph (v : A.data L.shape) : A.data =
       let open L in
       match v with
-      | BV v -> Some v
-      | True -> Some PrimQFBV.true_value
-      | False -> Some PrimQFBV.false_value
+      | BV v -> Some (BV v)
+      | True -> Some True
+      | False -> Some False
       | Or ls
         when List.exists
                (function
-                 | Some i when PrimQFBV.equal i PrimQFBV.true_value -> true
-                 | _ -> false)
+                 | Some i when A.equal_value i True -> true | _ -> false)
                ls ->
-          Some PrimQFBV.true_value
+          Some True
       | And ls
         when List.exists
                (function
-                 | Some i when i = PrimQFBV.false_value -> true | _ -> false)
+                 | Some i when A.equal_value i True -> true | _ -> false)
                ls ->
-          Some PrimQFBV.false_value
+          Some False
       | And ls
         when List.for_all
                (function
-                 | Some i when PrimQFBV.equal i PrimQFBV.true_value -> true
-                 | _ -> false)
+                 | Some i when A.equal_value i True -> true | _ -> false)
                ls ->
-          Some PrimQFBV.true_value
+          Some True
       | Or ls
         when List.for_all
                (function
-                 | Some i when PrimQFBV.equal i PrimQFBV.false_value -> true
-                 | _ -> false)
+                 | Some i when A.equal_value i False -> true | _ -> false)
                ls ->
-          Some PrimQFBV.false_value
-      | Op ("bvadd", [ Some l; Some r ]) -> Some (PrimQFBV.add l r)
-      | Op ("bvand", [ Some l; Some r ]) -> Some (PrimQFBV.bitand l r)
-      | Op ("bvor", [ Some l; Some r ]) -> Some (PrimQFBV.bitor l r)
-      | Op ("bvxor", [ Some l; Some r ]) -> Some (PrimQFBV.bitxor l r)
-      | Op ("bvsub", [ Some l; Some r ]) -> Some (PrimQFBV.sub l r)
-      | Op ("bvnot", [ Some r ]) -> Some (PrimQFBV.bitnot r)
-      | Op ("bvneg", [ Some r ]) -> Some (PrimQFBV.neg r)
-      | Op ("bvsle", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.sle l r)
-      | Op ("bvslt", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.slt l r)
-      | Op ("bvsge", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.sge l r)
-      | Op ("bvsgt", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.sgt l r)
-      | Op ("bvule", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.ule l r)
-      | Op ("bvult", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.ult l r)
-      | Op ("bvuge", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.uge l r)
-      | Op ("bvugt", [ Some l; Some r ]) ->
-          Some (PrimQFBV.booltobv @@ PrimQFBV.ugt l r)
-      | Op ("=", [ Some l; Some r ]) when PrimQFBV.equal l r ->
-          Some PrimQFBV.true_value
-      | Op ("=", [ Some l; Some r ]) when not @@ PrimQFBV.equal l r ->
-          Some PrimQFBV.false_value
+          Some False
+      | Op ("bvadd", args) -> bind2_bv PrimQFBV.add args
+      | Op ("bvand", args) -> bind2_bv PrimQFBV.bitand args
+      | Op ("bvor", args) -> bind2_bv PrimQFBV.bitor args
+      | Op ("bvxor", args) -> bind2_bv PrimQFBV.bitxor args
+      | Op ("bvsub", args) -> bind2_bv PrimQFBV.sub args
+      | Op ("bvnot", [ Some (BV r) ]) -> Some (BV (PrimQFBV.bitnot r))
+      | Op ("bvneg", [ Some (BV r) ]) -> Some (BV (PrimQFBV.neg r))
+      | Op ("bvsle", args) -> bind2_bv_bool PrimQFBV.sle args
+      | Op ("bvslt", args) -> bind2_bv_bool PrimQFBV.slt args
+      | Op ("bvsge", args) -> bind2_bv_bool PrimQFBV.sge args
+      | Op ("bvsgt", args) -> bind2_bv_bool PrimQFBV.sgt args
+      | Op ("bvule", args) -> bind2_bv_bool PrimQFBV.ule args
+      | Op ("bvult", args) -> bind2_bv_bool PrimQFBV.ult args
+      | Op ("bvuge", args) -> bind2_bv_bool PrimQFBV.uge args
+      | Op ("bvugt", args) -> bind2_bv_bool PrimQFBV.ugt args
+      | Op ("=", [ Some l; Some r ]) -> (
+          match A.equal_value l r with true -> Some True | false -> Some False)
       | _ -> None
 
     let make : Ego.Generic.ro t -> Ego.Id.t L.shape -> A.data =
-     fun graph term -> eval (L.map_children term (S.get_data graph))
+     fun graph term -> eval graph (L.map_children term (S.get_data graph))
 
     let merge : A.t -> A.data -> A.data -> A.data * (bool * bool) =
      fun s d d ->
       match (d, d) with
       | Some l, None -> (Some l, (false, true))
       | None, Some l -> (Some l, (true, false))
-      | Some l, Some r when PrimQFBV.equal l r -> (Some l, (false, false))
+      | Some l, Some r when A.equal_value l r -> (Some l, (false, false))
       | Some l, Some r -> (None, (false, false))
       | None, None -> (None, (false, false))
 
@@ -408,8 +420,14 @@ module Gen = struct
      fun graph cls ->
       match S.get_data (S.freeze graph) cls with
       | None -> ()
-      | Some n ->
+      | Some (BV n) ->
           let nw_cls = S.add_node graph (L.Mk (BV n)) in
+          S.merge graph nw_cls cls
+      | Some True ->
+          let nw_cls = S.add_node graph (L.Mk L.True) in
+          S.merge graph nw_cls cls
+      | Some False ->
+          let nw_cls = S.add_node graph (L.Mk L.False) in
           S.merge graph nw_cls cls
   end
 
@@ -449,7 +467,7 @@ module Gen = struct
       let cond =
        fun graph enode emap ->
         EGraph.get_data (EGraph.freeze graph) enode |> function
-        | Some a when a = PrimQFBV.true_value -> true
+        | Some a when a = A.True -> true
         | _ -> false
       in
       Rule.make_conditional ~from ~into ~cond
@@ -460,7 +478,7 @@ module Gen = struct
       let cond =
        fun graph enode emap ->
         EGraph.get_data (EGraph.freeze graph) enode |> function
-        | Some a when a = PrimQFBV.false_value -> true
+        | Some a when a = A.False -> true
         | _ -> false
       in
       Rule.make_conditional ~from ~into ~cond
@@ -471,7 +489,7 @@ module Gen = struct
       let cond =
        fun graph enode emap ->
         EGraph.get_data (EGraph.freeze graph) enode |> function
-        | Some a when a = PrimQFBV.true_value -> true
+        | Some a when a = A.True -> true
         | _ -> false
       in
       Rule.make_conditional ~from ~into ~cond
@@ -482,7 +500,7 @@ module Gen = struct
       let cond =
        fun graph enode emap ->
         EGraph.get_data (EGraph.freeze graph) enode |> function
-        | Some a when a = PrimQFBV.false_value -> true
+        | Some a when a = A.False -> true
         | _ -> false
       in
       Rule.make_conditional ~from ~into ~cond
@@ -504,7 +522,7 @@ module Gen = struct
       let cond =
        fun graph enode emap ->
         EGraph.get_data (EGraph.freeze graph) enode |> function
-        | Some a when a = PrimQFBV.false_value -> true
+        | Some a when a = A.False -> true
         | _ -> false
       in
       Rule.make_conditional ~from ~into ~cond
@@ -621,8 +639,6 @@ module Gen = struct
     ]
 end
 
-module StringMap = Map.Make (String)
-
 let process fname =
   let open Sexplib0 in
   let open Gen in
@@ -632,15 +648,14 @@ let process fname =
   let add_if_equality grpah name e =
     let open Sexp in
     match e with
-    | List (Atom "=" :: rest) as o
-    (*when String.starts_with ~prefix:"inv" name *) ->
+    | List (Atom "=" :: rest) as o when String.starts_with ~prefix:"inv" name ->
         print_endline @@ "ground equality: " ^ Sexp.to_string o;
         let is = List.map (add_sexp graph) rest in
         let outer = add_sexp graph e in
         print_endline (Int.to_string @@ List.length is);
-        (match is with
+        (*(match is with
         | h :: tl -> List.iter (EGraph.merge graph h) tl
-        | _ -> ());
+        | _ -> ()); *)
         EGraph.rebuild graph;
         [ (name, e, outer) ]
     | o ->
@@ -654,10 +669,14 @@ let process fname =
     "unnamed_assert_" ^ Int.to_string !c
   in
 
+  let consts = ref StringMap.empty in
+
   let add s =
     let open Sexp in
     match s with
-    | List (Atom "declare-const" :: _) -> []
+    | List [ Atom "declare-const"; Atom const; ty ] ->
+        consts := StringMap.add const ty !consts;
+        []
     | List (Atom "set-logic" :: _) -> []
     | List (Atom "define-fun" :: _) -> []
     | List (Atom "check-sat" :: _) -> []
@@ -673,30 +692,39 @@ let process fname =
   let tr = add_sexp graph (Atom "true") in
   let fr = add_sexp graph (Atom "false") in
 
-  EGraph.merge graph tr
-    (EGraph.add_node graph (L.Mk (L.BV PrimQFBV.true_value)));
-  EGraph.merge graph fr
-    (EGraph.add_node graph (L.Mk (L.BV PrimQFBV.false_value)));
   EGraph.rebuild graph;
 
   let conj_asserts =
     List.map (function n, sexp, node -> sexp) asserts |> fun i ->
     Sexp.List (Sexp.Atom "and" :: i) |> cleanup |> add_sexp graph
   in
+  (*
   let _ =
     EGraph.run_until_saturation ~fuel:`Unbounded ~node_limit:`Unbounded graph
       rewrite_rules
   in
+  *)
   if EGraph.class_equal (EGraph.freeze graph) tr fr then print_endline "unsat";
+  let used_consts = ref StringSet.empty in
   let print_exp n e =
-    if not (EGraph.class_equal (EGraph.freeze graph) e tr) then
-      let e = Extractor.extract graph e in
-      Sexp.pp_hum_indent 1 (Format.get_std_formatter ())
-      @@ List
-           [
-             Atom "assert";
-             List [ Atom "!"; L.to_sexp e; Atom ":named"; Atom n ];
-           ]
+    if not (EGraph.class_equal (EGraph.freeze graph) e tr) then (
+      let e = L.to_sexp used_consts @@ Extractor.extract graph e in
+      let oc = open_out ("simped_" ^ fname) in
+      let f = Format.formatter_of_out_channel oc in
+      Format.pp_print_string f "\n(set-logic QF_BV)\n";
+      StringSet.to_list !used_consts
+      |> List.concat_map (function s ->
+             ( StringMap.find_opt s !consts |> function
+               | Some i -> [ (s, i) ]
+               | _ -> [] ))
+      |> List.iter (function c, t ->
+             Format.pp_print_string f @@ Sexp.to_string
+             @@ List [ Atom "declare-const"; Atom c; t ];
+             Format.pp_print_string f "\n");
+      Sexp.pp_hum_indent 1 f
+      @@ List [ Atom "assert"; List [ Atom "!"; e; Atom ":named"; Atom n ] ];
+      Format.pp_print_string f "\n(check-sat)\n";
+      close_out oc)
   in
   (*let e = StringMap.find "InvPrimed" exprs in
   print_exp "InvPrimed" e; *)
