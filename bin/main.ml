@@ -238,6 +238,15 @@ module Gen = struct
       | Mk (Or a) -> List (Atom "or" :: List.map (to_sexp consts) a)
       | Mk (Ite (c, a, b)) ->
           List [ Atom "ite"; to_sexp consts a; to_sexp consts b ]
+      | Mk (Op (c, [ x ])) when String.starts_with ~prefix:"extract" c -> (
+          match String.split_on_char '_' c with
+          | [ n; hi; lo ] ->
+              List
+                [
+                  List [ Atom "_"; Atom "extract"; Atom hi; Atom lo ];
+                  to_sexp consts x;
+                ]
+          | _ -> failwith "no")
       | Mk (Op (c, [])) ->
           consts := StringSet.add c !consts;
           Atom c
@@ -355,7 +364,7 @@ module Gen = struct
 
     let map_bv f a = match a with Some (A.BV a) -> Some (f a) | _ -> None
 
-    let eval graph (v : A.data L.shape) : A.data =
+    let eval (v : A.data L.shape) : A.data =
       let open L in
       match v with
       | BV v -> Some (BV v)
@@ -385,6 +394,8 @@ module Gen = struct
                  | Some i when A.equal_value i False -> true | _ -> false)
                ls ->
           Some False
+      | Op ("not", [ Some True ]) -> Some False
+      | Op ("not", [ Some False ]) -> Some True
       | Op ("bvadd", args) -> bind2_bv PrimQFBV.add args
       | Op ("bvand", args) -> bind2_bv PrimQFBV.bitand args
       | Op ("bvor", args) -> bind2_bv PrimQFBV.bitor args
@@ -405,7 +416,10 @@ module Gen = struct
       | _ -> None
 
     let make : Ego.Generic.ro t -> Ego.Id.t L.shape -> A.data =
-     fun graph term -> eval graph (L.map_children term (S.get_data graph))
+     fun graph term ->
+      match term with
+      | L.Op ("=", [ l; r ]) when S.class_equal graph l r -> Some True
+      | term -> eval (L.map_children term (S.get_data graph))
 
     let merge : A.t -> A.data -> A.data -> A.data * (bool * bool) =
      fun s d d ->
@@ -616,17 +630,21 @@ module Gen = struct
       Rule.make_constant ~from ~into
     in
     [
+      norm_impl;
+      double_negation;
+      ite_true;
+      ite_false;
+      and_simp_l;
+      and_simp_r;
       eq_rule;
+      bool_inv;
+      (*
       eq_const_false;
       and_const_false;
       and_const_true;
       or_const_false;
       or_const_true;
-      double_negation;
       bool_inv;
-      norm_impl;
-      ite_true;
-      ite_false;
       and_true;
       and_refute_l;
       and_refute_r;
@@ -634,8 +652,7 @@ module Gen = struct
       or_false_r;
       or_true_l;
       or_true_r;
-      and_simp_l;
-      and_simp_r;
+      *)
     ]
 end
 
@@ -647,15 +664,19 @@ let process fname =
 
   let add_if_equality grpah name e =
     let open Sexp in
+    let ok n =
+      String.starts_with ~prefix:"inv" n
+      || String.starts_with ~prefix:"unnamed" n
+    in
     match e with
-    | List (Atom "=" :: rest) as o when String.starts_with ~prefix:"inv" name ->
+    | List (Atom "=" :: rest) as o when ok name ->
         print_endline @@ "ground equality: " ^ Sexp.to_string o;
         let is = List.map (add_sexp graph) rest in
         let outer = add_sexp graph e in
         print_endline (Int.to_string @@ List.length is);
-        (*(match is with
+        (match is with
         | h :: tl -> List.iter (EGraph.merge graph h) tl
-        | _ -> ()); *)
+        | _ -> ());
         EGraph.rebuild graph;
         [ (name, e, outer) ]
     | o ->
@@ -698,12 +719,10 @@ let process fname =
     List.map (function n, sexp, node -> sexp) asserts |> fun i ->
     Sexp.List (Sexp.Atom "and" :: i) |> cleanup |> add_sexp graph
   in
-  (*
   let _ =
     EGraph.run_until_saturation ~fuel:`Unbounded ~node_limit:`Unbounded graph
       rewrite_rules
   in
-  *)
   if EGraph.class_equal (EGraph.freeze graph) tr fr then print_endline "unsat";
   let used_consts = ref StringSet.empty in
   let print_exp n e =
