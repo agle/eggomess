@@ -396,6 +396,7 @@ module Gen = struct
           Some False
       | Op ("not", [ Some True ]) -> Some False
       | Op ("not", [ Some False ]) -> Some True
+      | Op ("concat", args) -> bind2_bv PrimQFBV.concat args
       | Op ("bvadd", args) -> bind2_bv PrimQFBV.add args
       | Op ("bvand", args) -> bind2_bv PrimQFBV.bitand args
       | Op ("bvor", args) -> bind2_bv PrimQFBV.bitor args
@@ -411,6 +412,10 @@ module Gen = struct
       | Op ("bvult", args) -> bind2_bv_bool PrimQFBV.ult args
       | Op ("bvuge", args) -> bind2_bv_bool PrimQFBV.uge args
       | Op ("bvugt", args) -> bind2_bv_bool PrimQFBV.ugt args
+      | Op ("bvcomp", [ Some l; Some r ]) -> (
+          match A.equal_value l r with
+          | true -> Some (A.BV PrimQFBV.true_value)
+          | false -> Some (A.BV PrimQFBV.false_value))
       | Op ("=", [ Some l; Some r ]) -> (
           match A.equal_value l r with true -> Some True | false -> Some False)
       | _ -> None
@@ -459,6 +464,8 @@ module Gen = struct
       | True -> 1.0
       | False -> 1.0
       | BV v -> 2.0
+      | Op (i, []) when String.starts_with ~prefix:"source" i -> 5.0
+      | Op (i, []) when String.starts_with ~prefix:"tgt" i -> 7.0
       | Op ("and", _) -> 20.0 +. c
       | Op ("or", _) -> 20.0 +. c
       | Op ("=>", _) -> 20.0 +. c
@@ -745,8 +752,8 @@ let process fname =
       Format.pp_print_string f "\n(check-sat)\n";
       close_out oc)
   in
-  (*let e = StringMap.find "InvPrimed" exprs in
-  print_exp "InvPrimed" e; *)
+  let n, s, e = List.find (function n, i, _ -> n = "InvPrimed") asserts in
+  (*print_exp "InvPrimed" e;*)
   (*List.iter (function n, e -> print_exp n e) asserts;*)
   print_exp "ConjAsserts" conj_asserts;
   ()
